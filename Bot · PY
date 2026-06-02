@@ -1,0 +1,394 @@
+import os
+import asyncio
+import time
+import discord
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+
+from market_data import MarketData
+from user_settings import UserSettings
+from utils import format_price, format_change, get_emoji, build_market_embed
+
+load_dotenv()
+
+DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")
+ALERT_COOLDOWN = 5 * 60  # 5 min entre deux alertes par symbole/user
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!iris ", intents=intents, help_command=None)
+mkt = MarketData()
+usr = UserSettings()
+
+live_messages: dict = {}
+alert_cooldowns: dict = {}
+
+# ── Démarrage ─────────────────────────────────────────────────────────────────
+@bot.event
+async def on_ready():
+    print(f"✅ Iris Trading connectée : {bot.user}")
+    mkt.start()
+    update_live_loop.start()
+    check_alerts_loop.start()
+
+# ── Tâches ────────────────────────────────────────────────────────────────────
+@tasks.loop(seconds=30)
+async def update_live_loop():
+    for key, info in list(live_messages.items()):
+        try:
+            channel = bot.get_channel(info["channel_id"])
+            if not channel:
+                live_messages.pop(key, None)
+                continue
+            msg      = await channel.fetch_message(info["message_id"])
+            settings = usr.get(info["user_id"])
+            embed    = await build_market_embed(mkt, settings, info["user_id"])
+            await msg.edit(embed=embed)
+        except Exception as e:
+            print(f"Erreur update live: {e}")
+
+@tasks.loop(seconds=60)
+async def check_alerts_loop():
+    for user_id, settings in usr.get_all():
+        if not settings.get("alerts_enabled", True):
+            continue
+        threshold = settings.get("alert_threshold", 3.0)
+        symbols   = list(set(
+            settings.get("watchlist", []) +
+            [p["symbol"] for p in settings.get("portfolio", [])]
+        ))
+        for symbol in symbols:
+            data = await mkt.get_quote(symbol)
+            if not data:
+                continue
+            change = abs(data.get("changePercent", 0))
+            if change < threshold:
+                continue
+            cd   = alert_cooldowns.setdefault(user_id, {})
+            last = cd.get(symbol, 0)
+            if time.time() - last < ALERT_COOLDOWN:
+                continue
+            cd[symbol] = time.time()
+            try:
+                user      = await bot.fetch_user(user_id)
+                direction = "🚀 Hausse" if data["changePercent"] > 0 else "📉 Baisse"
+                await user.send(
+                    f"**{direction} notable — {symbol}**\n"
+                    f"Variation : **{format_change(data['changePercent'])}%** | "
+                    f"Prix : **{format_price(data['price'])}**\n\n"
+                    f"Tape `!iris conseil {symbol}` pour un avis IA."
+                )
+            except Exception:
+                pass
+
+# ── COMMANDES ─────────────────────────────────────────────────────────────────
+
+@bot.command(name="help")
+async def cmd_help(ctx):
+    embed = discord.Embed(
+        title="💜 Iris Trading — Aide",
+        description="Bot de trading temps réel · IA gratuite sans clé · Personnalisable par utilisateur",
+        color=0x6C5CE7,
+    )
+    embed.add_field(name="📺 `!iris live`",          value="Dashboard live (auto toutes les 30s)",    inline=False)
+    embed.add_field(name="📊 `!iris info SYMBOLE`",  value="Infos détaillées sur un actif",           inline=False)
+    embed.add_field(name="⚙️ `!iris settings`",      value="Voir/modifier ta watchlist et alertes",   inline=False)
+    embed.add_field(name="💼 `!iris portfolio`",     value="Gérer ton portfolio et voir les P&L",     inline=False)
+    embed.add_field(name="🔔 `!iris alert SYM %`",   value="Alerte DM si le prix bouge de X%",        inline=False)
+    embed.add_field(name="🤖 `!iris conseil [SYM]`", value="Conseil IA gratuit (Pollinations.ai)",    inline=False)
+    embed.add_field(name="🔄 `!iris reset`",         value="Réinitialiser tes settings",              inline=False)
+    embed.add_field(
+        name="💡 Exemples de symboles",
+        value="`AAPL` Apple · `^FCHI` CAC40 · `BTC-USD` Bitcoin · `TSLA` Tesla · `^GSPC` S&P500 · `BNP.PA` BNP",
+        inline=False,
+    )
+    embed.set_footer(text="Iris Trading • Powered by Pollinations.ai — 100% gratuit, aucune clé requise")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="live")
+async def cmd_live(ctx):
+    user_id  = ctx.author.id
+    settings = usr.get(user_id)
+    embed    = await build_market_embed(mkt, settings, user_id)
+    view     = LiveView(user_id)
+    msg      = await ctx.send(embed=embed, view=view)
+    live_messages[f"{ctx.channel.id}:{user_id}"] = {
+        "channel_id": ctx.channel.id,
+        "message_id": msg.id,
+        "user_id":    user_id,
+    }
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+
+@bot.command(name="settings")
+async def cmd_settings(ctx, sub: str = "view", *args):
+    user_id = ctx.author.id
+    sub     = sub.lower()
+
+    if sub == "view":
+        s = usr.get(user_id)
+        embed = discord.Embed(title="⚙️ Tes Paramètres Iris Trading", color=0x6C5CE7)
+        embed.add_field(name="📊 Watchlist",    value=", ".join(s["watchlist"]) or "Vide",         inline=False)
+        embed.add_field(name="🔔 Alertes",      value="✅ On" if s["alerts_enabled"] else "❌ Off", inline=True)
+        embed.add_field(name="📈 Seuil alerte", value=f"{s['alert_threshold']}%",                  inline=True)
+        embed.add_field(name="💱 Devise",       value=s["currency"],                                inline=True)
+        embed.set_footer(text="Ces paramètres s'appliquent uniquement à toi")
+        return await ctx.send(embed=embed)
+
+    if sub == "add" and args:
+        symbol = args[0].upper()
+        valid  = await mkt.is_valid(symbol)
+        if not valid:
+            return await ctx.send(f"❌ Symbole `{symbol}` introuvable.")
+        usr.add_to_watchlist(user_id, symbol)
+        return await ctx.send(f"✅ **{symbol}** ajouté à ta watchlist !")
+
+    if sub == "remove" and args:
+        usr.remove_from_watchlist(user_id, args[0].upper())
+        return await ctx.send(f"🗑️ **{args[0].upper()}** retiré.")
+
+    if sub == "alert" and args:
+        val = args[0].lower()
+        if val == "on":
+            usr.update(user_id, {"alerts_enabled": True})
+            return await ctx.send("🔔 Alertes **activées**.")
+        if val == "off":
+            usr.update(user_id, {"alerts_enabled": False})
+            return await ctx.send("🔕 Alertes **désactivées**.")
+        try:
+            usr.update(user_id, {"alert_threshold": float(val)})
+            return await ctx.send(f"📊 Seuil réglé à **{val}%**.")
+        except ValueError:
+            pass
+
+    if sub == "currency" and args:
+        usr.update(user_id, {"currency": args[0].upper()})
+        return await ctx.send(f"💱 Devise changée en **{args[0].upper()}**.")
+
+    await ctx.send(
+        "**Sous-commandes :**\n"
+        "`!iris settings view` · `!iris settings add SYMBOLE` · `!iris settings remove SYMBOLE`\n"
+        "`!iris settings alert on/off` · `!iris settings alert 3` · `!iris settings currency EUR`"
+    )
+
+
+@bot.command(name="info")
+async def cmd_info(ctx, symbol: str = None):
+    if not symbol:
+        return await ctx.send("Usage : `!iris info SYMBOLE` (ex: `!iris info AAPL`)")
+    symbol = symbol.upper()
+    data   = await mkt.get_detailed_quote(symbol)
+    if not data:
+        return await ctx.send(f"❌ Symbole `{symbol}` introuvable.")
+
+    color = 0x00b894 if data.get("changePercent", 0) >= 0 else 0xff7675
+    embed = discord.Embed(
+        title=f"{get_emoji(data.get('changePercent', 0))} {data['symbol']} — {data.get('name', symbol)}",
+        color=color,
+    )
+    embed.add_field(name="💲 Prix",           value=f"**{format_price(data['price'])}** {data.get('currency', '')}", inline=True)
+    embed.add_field(name="📊 Variation",      value=f"**{format_change(data.get('changePercent', 0))}%**",           inline=True)
+    embed.add_field(name="📦 Volume",         value=f"{data.get('volume', 0):,}",                                    inline=True)
+    embed.add_field(name="⬆️ Haut du jour",  value=format_price(data.get("dayHigh")),                               inline=True)
+    embed.add_field(name="⬇️ Bas du jour",   value=format_price(data.get("dayLow")),                                inline=True)
+    embed.add_field(name="📈 Plus haut 52s", value=format_price(data.get("high52w")),                               inline=True)
+    embed.add_field(name="📉 Plus bas 52s",  value=format_price(data.get("low52w")),                                inline=True)
+    if data.get("marketCap"):
+        embed.add_field(name="🏦 Capitalisation", value=f"{data['marketCap']/1e9:.2f}B", inline=True)
+    embed.set_footer(text="Iris Trading • Yahoo Finance")
+    embed.timestamp = discord.utils.utcnow()
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="portfolio")
+async def cmd_portfolio(ctx, sub: str = "view", *args):
+    user_id = ctx.author.id
+    sub     = sub.lower()
+
+    if sub == "add" and len(args) >= 2:
+        symbol = args[0].upper()
+        try:
+            qty   = float(args[1])
+            price = float(args[2]) if len(args) >= 3 else None
+        except ValueError:
+            return await ctx.send("❌ Quantité ou prix invalide.")
+        usr.add_position(user_id, symbol, qty, price)
+        return await ctx.send(f"✅ **{qty}x {symbol}**" + (f" @ {price}" if price else "") + " ajouté.")
+
+    if sub == "remove" and args:
+        usr.remove_position(user_id, args[0].upper())
+        return await ctx.send(f"🗑️ **{args[0].upper()}** retiré.")
+
+    settings  = usr.get(user_id)
+    portfolio = settings.get("portfolio", [])
+    if not portfolio:
+        return await ctx.send(
+            "📭 Portfolio vide.\n"
+            "Ajoute : `!iris portfolio add SYMBOLE QUANTITE PRIX_ACHAT`"
+        )
+
+    positions = []
+    for pos in portfolio:
+        data = await mkt.get_quote(pos["symbol"])
+        if not data:
+            continue
+        current_val = data["price"] * pos["qty"]
+        buy_val     = (pos.get("buy_price") or data["price"]) * pos["qty"]
+        pnl         = current_val - buy_val
+        pnl_pct     = (pnl / buy_val * 100) if buy_val else 0
+        positions.append({**pos, "price": data["price"], "current_val": current_val, "pnl": pnl, "pnl_pct": pnl_pct})
+
+    total_val = sum(p["current_val"] for p in positions)
+    total_pnl = sum(p["pnl"] for p in positions)
+
+    embed = discord.Embed(title="💼 Ton Portfolio", color=0x00b894 if total_pnl >= 0 else 0xff7675)
+    for p in positions:
+        sign = "+" if p["pnl_pct"] >= 0 else ""
+        embed.add_field(
+            name=f"{get_emoji(p['pnl_pct'])} {p['symbol']}",
+            value=(
+                f"{p['qty']} × {format_price(p['price'])} = **{format_price(p['current_val'])}**\n"
+                f"P&L : {format_change(p['pnl'])} ({sign}{p['pnl_pct']:.2f}%)"
+            ),
+            inline=True,
+        )
+    embed.add_field(name="💰 Valeur totale",                               value=f"**{format_price(total_val)}**",  inline=True)
+    embed.add_field(name=f"{'📈' if total_pnl >= 0 else '📉'} P&L total", value=f"**{format_change(total_pnl)}**", inline=True)
+    embed.set_footer(text="Iris Trading • Données temps réel")
+    embed.timestamp = discord.utils.utcnow()
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="alert")
+async def cmd_alert(ctx, symbol: str = None, threshold: str = None):
+    if not symbol or not threshold:
+        return await ctx.send("Usage : `!iris alert SYMBOLE SEUIL` (ex: `!iris alert AAPL 3`)")
+    try:
+        t = float(threshold)
+    except ValueError:
+        return await ctx.send("❌ Seuil invalide.")
+    usr.add_custom_alert(ctx.author.id, symbol.upper(), t)
+    await ctx.send(f"🔔 Alerte créée : DM si **{symbol.upper()}** bouge de **{t}%**.")
+
+
+@bot.command(name="conseil")
+async def cmd_conseil(ctx, *args):
+    user_id = ctx.author.id
+    symbols = [a.upper() for a in args] if args else usr.get(user_id).get("watchlist", [])
+    if not symbols:
+        return await ctx.send("❓ Ajoute des actifs ou précise un symbole : `!iris conseil AAPL`")
+    async with ctx.typing():
+        reply = await get_ai_advice(user_id, symbols)
+    await ctx.send(reply)
+
+
+@bot.command(name="reset")
+async def cmd_reset(ctx):
+    usr.reset(ctx.author.id)
+    await ctx.send("🔄 Tes paramètres ont été réinitialisés.")
+
+
+# ── Conseil IA via Pollinations.ai (100% gratuit, aucune clé) ─────────────────
+async def get_ai_advice(user_id: int, symbols: list) -> str:
+    import aiohttp
+    import urllib.parse
+
+    quotes = [q for q in [await mkt.get_quote(s) for s in symbols] if q]
+    if not quotes:
+        return "❌ Impossible de récupérer les données pour ces symboles."
+
+    settings      = usr.get(user_id)
+    portfolio     = settings.get("portfolio", [])
+
+    market_text = "\n".join(
+        f"{q['symbol']}: {format_price(q['price'])} ({format_change(q.get('changePercent', 0))}% aujourd'hui), "
+        f"volume: {q.get('volume', 0):,}"
+        for q in quotes
+    )
+    portfolio_ctx = ""
+    if portfolio:
+        portfolio_ctx = "\nPortfolio utilisateur : " + ", ".join(
+            f"{p['qty']}x {p['symbol']} acheté à {p.get('buy_price', 'inconnu')}"
+            for p in portfolio
+        )
+
+    system_prompt = (
+        "Tu es Iris, une conseillère en trading expérimentée et directe. "
+        "Tu analyses les données de marché et donnes des conseils concis, honnêtes et nuancés. "
+        "Tu rappelles toujours que ce ne sont pas des conseils financiers professionnels. "
+        "Tu réponds en français avec des emojis pour structurer. Maximum 400 mots."
+    )
+
+    user_prompt = (
+        f"Analyse ces actifs et donne un conseil de trading :\n\n{market_text}{portfolio_ctx}\n\n"
+        "Donne : 1) Analyse rapide 2) Points d'attention 3) Ce que tu ferais"
+    )
+
+    try:
+        # Pollinations.ai — API texte gratuite, aucune clé requise
+        payload = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "model":  "openai",   # modèle GPT-4o via Pollinations
+            "seed":   42,
+            "private": True,      # ne pas logger la conversation
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://text.pollinations.ai/openai",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                if resp.status != 200:
+                    return f"❌ Erreur Pollinations ({resp.status}). Réessaie dans quelques secondes."
+                data = await resp.json()
+
+        return data["choices"][0]["message"]["content"]
+
+    except asyncio.TimeoutError:
+        return "⏱️ L'IA met trop de temps à répondre. Réessaie dans quelques secondes."
+    except Exception as e:
+        return f"❌ Erreur IA : {e}"
+
+
+# ── Boutons Discord ────────────────────────────────────────────────────────────
+class LiveView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+
+    @discord.ui.button(label="🔄 Actualiser", style=discord.ButtonStyle.secondary)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        settings = usr.get(self.user_id)
+        embed    = await build_market_embed(mkt, settings, self.user_id)
+        await interaction.message.edit(embed=embed)
+
+    @discord.ui.button(label="➕ Ajouter", style=discord.ButtonStyle.primary)
+    async def add_sym(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Tape `!iris settings add SYMBOLE` pour ajouter un actif.", ephemeral=True
+        )
+
+    @discord.ui.button(label="🤖 Conseil IA", style=discord.ButtonStyle.success)
+    async def ai_advice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        reply = await get_ai_advice(
+            interaction.user.id,
+            usr.get(interaction.user.id).get("watchlist", [])
+        )
+        await interaction.followup.send(reply, ephemeral=True)
+
+
+# ── Lancement ─────────────────────────────────────────────────────────────────
+bot.run(DISCORD_TOKEN)
