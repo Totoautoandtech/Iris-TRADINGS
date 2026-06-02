@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import time
@@ -12,7 +11,8 @@ from utils import format_price, format_change, get_emoji, build_market_embed
 
 load_dotenv()
 
-DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")
+# Correction de l'espace invisible sur cette ligne
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 ALERT_COOLDOWN = 5 * 60  # 5 min entre deux alertes par symbole/user
 
 intents = discord.Intents.default()
@@ -43,9 +43,9 @@ async def update_live_loop():
             if not channel:
                 live_messages.pop(key, None)
                 continue
-            msg      = await channel.fetch_message(info["message_id"])
+            msg = await channel.fetch_message(info["message_id"])
             settings = usr.get(info["user_id"])
-            embed    = await build_market_embed(mkt, settings, info["user_id"])
+            embed = await build_market_embed(mkt, settings, info["user_id"])
             await msg.edit(embed=embed)
         except Exception as e:
             print(f"Erreur update live: {e}")
@@ -56,7 +56,7 @@ async def check_alerts_loop():
         if not settings.get("alerts_enabled", True):
             continue
         threshold = settings.get("alert_threshold", 3.0)
-        symbols   = list(set(
+        symbols = list(set(
             settings.get("watchlist", []) +
             [p["symbol"] for p in settings.get("portfolio", [])]
         ))
@@ -67,13 +67,13 @@ async def check_alerts_loop():
             change = abs(data.get("changePercent", 0))
             if change < threshold:
                 continue
-            cd   = alert_cooldowns.setdefault(user_id, {})
+            cd = alert_cooldowns.setdefault(user_id, {})
             last = cd.get(symbol, 0)
             if time.time() - last < ALERT_COOLDOWN:
                 continue
             cd[symbol] = time.time()
             try:
-                user      = await bot.fetch_user(user_id)
+                user = await bot.fetch_user(user_id)
                 direction = "🚀 Hausse" if data["changePercent"] > 0 else "📉 Baisse"
                 await user.send(
                     f"**{direction} notable — {symbol}**\n"
@@ -81,8 +81,10 @@ async def check_alerts_loop():
                     f"Prix : **{format_price(data['price'])}**\n\n"
                     f"Tape `!iris conseil {symbol}` pour un avis IA."
                 )
-            except Exception:
-                pass
+            except discord.Forbidden:
+                print(f"⚠️ Impossible d'envoyer un DM à l'utilisateur {user_id} (DMs bloqués).")
+            except Exception as e:
+                print(f"Erreur envoi alerte: {e}")
 
 # ── COMMANDES ─────────────────────────────────────────────────────────────────
 
@@ -111,11 +113,11 @@ async def cmd_help(ctx):
 
 @bot.command(name="live")
 async def cmd_live(ctx):
-    user_id  = ctx.author.id
+    user_id = ctx.author.id
     settings = usr.get(user_id)
-    embed    = await build_market_embed(mkt, settings, user_id)
-    view     = LiveView(user_id)
-    msg      = await ctx.send(embed=embed, view=view)
+    embed = await build_market_embed(mkt, settings, user_id)
+    view = LiveView(user_id)
+    msg = await ctx.send(embed=embed, view=view)
     live_messages[f"{ctx.channel.id}:{user_id}"] = {
         "channel_id": ctx.channel.id,
         "message_id": msg.id,
@@ -130,7 +132,7 @@ async def cmd_live(ctx):
 @bot.command(name="settings")
 async def cmd_settings(ctx, sub: str = "view", *args):
     user_id = ctx.author.id
-    sub     = sub.lower()
+    sub = sub.lower()
 
     if sub == "view":
         s = usr.get(user_id)
@@ -144,7 +146,7 @@ async def cmd_settings(ctx, sub: str = "view", *args):
 
     if sub == "add" and args:
         symbol = args[0].upper()
-        valid  = await mkt.is_valid(symbol)
+        valid = await mkt.is_valid(symbol)
         if not valid:
             return await ctx.send(f"❌ Symbole `{symbol}` introuvable.")
         usr.add_to_watchlist(user_id, symbol)
@@ -184,7 +186,7 @@ async def cmd_info(ctx, symbol: str = None):
     if not symbol:
         return await ctx.send("Usage : `!iris info SYMBOLE` (ex: `!iris info AAPL`)")
     symbol = symbol.upper()
-    data   = await mkt.get_detailed_quote(symbol)
+    data = await mkt.get_detailed_quote(symbol)
     if not data:
         return await ctx.send(f"❌ Symbole `{symbol}` introuvable.")
 
@@ -210,12 +212,12 @@ async def cmd_info(ctx, symbol: str = None):
 @bot.command(name="portfolio")
 async def cmd_portfolio(ctx, sub: str = "view", *args):
     user_id = ctx.author.id
-    sub     = sub.lower()
+    sub = sub.lower()
 
     if sub == "add" and len(args) >= 2:
         symbol = args[0].upper()
         try:
-            qty   = float(args[1])
+            qty = float(args[1])
             price = float(args[2]) if len(args) >= 3 else None
         except ValueError:
             return await ctx.send("❌ Quantité ou prix invalide.")
@@ -226,7 +228,7 @@ async def cmd_portfolio(ctx, sub: str = "view", *args):
         usr.remove_position(user_id, args[0].upper())
         return await ctx.send(f"🗑️ **{args[0].upper()}** retiré.")
 
-    settings  = usr.get(user_id)
+    settings = usr.get(user_id)
     portfolio = settings.get("portfolio", [])
     if not portfolio:
         return await ctx.send(
@@ -240,9 +242,9 @@ async def cmd_portfolio(ctx, sub: str = "view", *args):
         if not data:
             continue
         current_val = data["price"] * pos["qty"]
-        buy_val     = (pos.get("buy_price") or data["price"]) * pos["qty"]
-        pnl         = current_val - buy_val
-        pnl_pct     = (pnl / buy_val * 100) if buy_val else 0
+        buy_val = (pos.get("buy_price") or data["price"]) * pos["qty"]
+        pnl = current_val - buy_val
+        pnl_pct = (pnl / buy_val * 100) if buy_val else 0
         positions.append({**pos, "price": data["price"], "current_val": current_val, "pnl": pnl, "pnl_pct": pnl_pct})
 
     total_val = sum(p["current_val"] for p in positions)
@@ -295,17 +297,16 @@ async def cmd_reset(ctx):
     await ctx.send("🔄 Tes paramètres ont été réinitialisés.")
 
 
-# ── Conseil IA via Pollinations.ai (100% gratuit, aucune clé) ─────────────────
+# ── Conseil IA via Pollinations.ai (Correction du format de réponse) ──────────
 async def get_ai_advice(user_id: int, symbols: list) -> str:
     import aiohttp
-    import urllib.parse
 
     quotes = [q for q in [await mkt.get_quote(s) for s in symbols] if q]
     if not quotes:
         return "❌ Impossible de récupérer les données pour ces symboles."
 
-    settings      = usr.get(user_id)
-    portfolio     = settings.get("portfolio", [])
+    settings = usr.get(user_id)
+    portfolio = settings.get("portfolio", [])
 
     market_text = "\n".join(
         f"{q['symbol']}: {format_price(q['price'])} ({format_change(q.get('changePercent', 0))}% aujourd'hui), "
@@ -332,15 +333,14 @@ async def get_ai_advice(user_id: int, symbols: list) -> str:
     )
 
     try:
-        # Pollinations.ai — API texte gratuite, aucune clé requise
         payload = {
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_prompt},
             ],
-            "model":  "openai",   # modèle GPT-4o via Pollinations
-            "seed":   42,
-            "private": True,      # ne pas logger la conversation
+            "model": "openai",
+            "seed": 42,
+            "private": True,
         }
 
         async with aiohttp.ClientSession() as session:
@@ -352,9 +352,10 @@ async def get_ai_advice(user_id: int, symbols: list) -> str:
             ) as resp:
                 if resp.status != 200:
                     return f"❌ Erreur Pollinations ({resp.status}). Réessaie dans quelques secondes."
-                data = await resp.json()
-
-        return data["choices"][0]["message"]["content"]
+                
+                # CORRIGÉ : On récupère la réponse sous forme de texte brut (.text())
+                reply_text = await resp.text()
+                return reply_text
 
     except asyncio.TimeoutError:
         return "⏱️ L'IA met trop de temps à répondre. Réessaie dans quelques secondes."
@@ -372,7 +373,7 @@ class LiveView(discord.ui.View):
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         settings = usr.get(self.user_id)
-        embed    = await build_market_embed(mkt, settings, self.user_id)
+        embed = await build_market_embed(mkt, settings, self.user_id)
         await interaction.message.edit(embed=embed)
 
     @discord.ui.button(label="➕ Ajouter", style=discord.ButtonStyle.primary)
