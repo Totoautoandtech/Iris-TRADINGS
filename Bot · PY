@@ -1,3 +1,18 @@
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot en ligne !"
+
+def run():
+  app.run(host='0.0.0.0', port=8080)
+
+# Lance le mini-site en arrière-plan
+Thread(target=run).start()
+
 import os
 import asyncio
 import time
